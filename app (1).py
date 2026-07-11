@@ -20,8 +20,12 @@ from typing import Any, Dict, List, Optional
 import chromadb
 import streamlit as st
 from chromadb.utils import embedding_functions
-
+git add FoodDataSet.json
+git commit -m "Add food dataset"
+git push
 # --------------------------------------------------------------------------
+
+wget https://cf-courses-data.s3.us.cloud-object-storage.appdomain.cloud/sN1PIR8qp1SJ6K7syv72qQ/FoodDataSet.json
 # Configuration
 # --------------------------------------------------------------------------
 COLLECTION_NAME = "interactive_food_search"
