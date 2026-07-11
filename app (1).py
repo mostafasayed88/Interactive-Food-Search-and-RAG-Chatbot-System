@@ -1,164 +1,215 @@
 """
-Streamlit UI for the Interactive Food Search & RAG Chatbot System.
+Interactive Food Search & RAG Chatbot System - Streamlit UI
+=============================================================
 
-Converted from the original notebook `Interactive_Food_Search_and_RAG_Chatbot_System.ipynb`
-which implemented a CLI chatbot over ChromaDB + Sentence-Transformers.
+A web interface for semantic food search backed by ChromaDB and
+sentence-transformers embeddings.
 
-Run:
-    streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+Run with:
+    streamlit run app.py
+
+Requires a food dataset JSON file to be uploaded via the sidebar before any
+search can be performed. See `requirements.txt` for dependencies.
 """
 
-from __future__ import annotations
-
 import json
+import logging
 import re
 from typing import Any, Dict, List, Optional
 
+import chromadb
 import streamlit as st
+from chromadb.utils import embedding_functions
 
-# -----------------------------------------------------------------------------
-# Constants
-# -----------------------------------------------------------------------------
-DATA_FILE = "FoodDataSet.json"
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
 COLLECTION_NAME = "interactive_food_search"
-EMBEDDING_MODEL = "paraphrase-MiniLM-L12-v2"
+EMBEDDING_MODEL_NAME = "paraphrase-MiniLM-L12-v2"
+DEFAULT_RESULT_COUNT = 4
+
+INGREDIENT_SYNONYMS = {
+    "sugar": ["sugar", "sweetener"],
+    "salt": ["salt", "seasoning"],
+    "flour": ["flour", "baking powder"],
+}
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger("food_search")
 
 
-# -----------------------------------------------------------------------------
-# Data loading & ChromaDB helpers  (ported from the notebook)
-# -----------------------------------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def get_chroma_client():
-    """Create a single ChromaDB client (cached for the whole session)."""
-    import chromadb
-    return chromadb.Client()
+# --------------------------------------------------------------------------
+# Data loading
+# --------------------------------------------------------------------------
+def load_food_data(uploaded_file) -> List[Dict[str, Any]]:
+    """Parse and normalize food data from an uploaded JSON file.
 
+    Args:
+        uploaded_file: A Streamlit `UploadedFile` object.
 
-def load_food_data(file_path: str) -> List[Dict[str, Any]]:
-    """Load and normalize food data from a JSON file."""
-    with open(file_path, "r", encoding="utf-8") as f:
-        food_data = json.load(f)
+    Returns:
+        A list of normalized food-item dictionaries. Empty on failure.
+    """
+    try:
+        food_data = json.load(uploaded_file)
+    except json.JSONDecodeError as error:
+        st.error(f"Could not parse the uploaded file as JSON: {error}")
+        return []
 
-    for i, item in enumerate(food_data):
-        item["food_id"] = str(item.get("food_id", i + 1))
+    if not isinstance(food_data, list):
+        st.error("The uploaded JSON must be a list of food items.")
+        return []
+
+    for index, item in enumerate(food_data):
+        item["food_id"] = str(item.get("food_id", index + 1))
         item.setdefault("food_ingredients", [])
         item.setdefault("food_description", "")
         item.setdefault("cuisine_type", "Unknown")
         item.setdefault("food_calories_per_serving", 0)
 
-        if "food_features" in item and isinstance(item["food_features"], dict):
-            taste_features = [str(v) for v in item["food_features"].values() if v]
-            item["taste_profile"] = ", ".join(taste_features)
+        features = item.get("food_features")
+        if isinstance(features, dict):
+            item["taste_profile"] = ", ".join(str(v) for v in features.values() if v)
         else:
             item["taste_profile"] = ""
 
     return food_data
 
 
-def build_search_collection(client, food_items: List[Dict[str, Any]]):
-    """Create (or reset) the ChromaDB collection and populate it with food items."""
-    from chromadb.utils import embedding_functions
+# --------------------------------------------------------------------------
+# Vector store setup
+# --------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def get_chroma_client():
+    """Create (once per session) the shared ChromaDB client."""
+    return chromadb.Client()
 
+
+def create_similarity_search_collection(
+    collection_name: str,
+    collection_metadata: Optional[Dict[str, Any]] = None,
+    model_name: str = EMBEDDING_MODEL_NAME,
+):
+    """Create (or recreate) a ChromaDB collection for semantic search."""
+    client = get_chroma_client()
     try:
-        client.delete_collection(COLLECTION_NAME)
+        client.delete_collection(collection_name)
     except Exception:
         pass
 
-    ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL)
-    collection = client.create_collection(
-        name=COLLECTION_NAME,
-        metadata={"description": "Interactive food search collection"},
-        configuration={"hnsw": {"space": "cosine"}, "embedding_function": ef},
+    embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name=model_name
     )
 
+    return client.create_collection(
+        name=collection_name,
+        metadata=collection_metadata,
+        configuration={
+            "hnsw": {"space": "cosine"},
+            "embedding_function": embedding_function,
+        },
+    )
+
+
+def _expand_ingredient_synonyms(ingredients_text: str) -> str:
+    """Insert known synonyms into an ingredient string to improve recall."""
+    for term, synonyms in INGREDIENT_SYNONYMS.items():
+        pattern = r"\b" + re.escape(term) + r"\b"
+        ingredients_text = re.sub(pattern, ", ".join(synonyms), ingredients_text)
+    return ingredients_text
+
+
+def _build_embedding_text(food: Dict[str, Any]) -> str:
+    """Compose a single descriptive string used to embed a food item."""
+    name = food.get("food_name", "").lower().strip()
+    description = food.get("food_description", "").lower().strip()
+    ingredients = _expand_ingredient_synonyms(
+        ", ".join(food.get("food_ingredients", [])).lower().strip()
+    )
+    cuisine_type = food.get("cuisine_type", "").lower().strip()
+    cooking_method = food.get("cooking_method", "").lower().strip()
+
+    parts = [
+        f"Name: {name}.",
+        f"Description: {description}.",
+        f"Ingredients: {ingredients}.",
+        f"Cuisine: {cuisine_type}.",
+        f"Cooking method: {cooking_method}.",
+    ]
+
+    taste_profile = food.get("taste_profile", "")
+    if taste_profile:
+        parts.append(f"Taste and features: {taste_profile}.")
+
+    health_benefits = food.get("food_health_benefits", "")
+    if health_benefits:
+        parts.append(f"Health benefits: {health_benefits}.")
+
+    nutrition = food.get("food_nutritional_factors")
+    if isinstance(nutrition, dict) and nutrition:
+        nutrition_text = ", ".join(f"{key}: {value}" for key, value in nutrition.items())
+        parts.append(f"Nutrition: {nutrition_text}.")
+
+    return " ".join(parts)
+
+
+def populate_similarity_collection(collection, food_items: List[Dict[str, Any]]) -> None:
+    """Embed and insert every food item into a ChromaDB collection."""
     documents: List[str] = []
     metadatas: List[Dict[str, Any]] = []
     ids: List[str] = []
-    used_ids: set[str] = set()
+    used_ids = set()
 
-    for i, food in enumerate(food_items):
-        name = food.get("food_name", "").lower().strip()
-        description = food.get("food_description", "").lower().strip()
-        ingredients = ", ".join(food.get("food_ingredients", [])).lower().strip()
-        cuisine_type = food.get("cuisine_type", "").lower().strip()
-        cooking_method = food.get("cooking_method", "").lower().strip()
+    for index, food in enumerate(food_items):
+        documents.append(_build_embedding_text(food))
 
-        # Apply synonym expansion (kept identical to the notebook)
-        ingredient_synonyms = {
-            "sugar": ["sugar", "sweetener"],
-            "salt": ["salt", "flour"],
-            "flour": ["flour", "baking powder"],
-        }
-        for key, syns in ingredient_synonyms.items():
-            ingredients = re.sub(r"\b" + re.escape(key) + r"\b", ", ".join(syns), ingredients)
-
-        text = (
-            f"Name: {name}. Description: {description}. "
-            f"Ingredients: {ingredients}. Cuisine: {cuisine_type}. "
-            f"Cooking method: {cooking_method}. "
-        )
-        taste_profile = food.get("taste_profile", "")
-        if taste_profile:
-            text += f"Taste and features: {taste_profile}. "
-        health_benefits = food.get("food_health_benefits", "")
-        if health_benefits:
-            text += f"Health benefits: {health_benefits}. "
-        nutrition = food.get("food_nutritional_factors")
-        if isinstance(nutrition, dict):
-            text += "Nutrition: " + ", ".join(f"{k}: {v}" for k, v in nutrition.items()) + "."
-
-        base_id = str(food.get("food_id", i))
-        unique_id = base_id
-        counter = 1
+        base_id = str(food.get("food_id", index))
+        unique_id, suffix = base_id, 1
         while unique_id in used_ids:
-            unique_id = f"{base_id}_{counter}"
-            counter += 1
+            unique_id = f"{base_id}_{suffix}"
+            suffix += 1
         used_ids.add(unique_id)
-
-        documents.append(text)
         ids.append(unique_id)
-        metadatas.append({
-            "name": food.get("food_name", "Unknown"),
-            "cuisine_type": food.get("cuisine_type", "Unknown"),
-            "ingredients": ", ".join(food.get("food_ingredients", [])),
-            "calories": int(food.get("food_calories_per_serving", 0) or 0),
-            "description": food.get("food_description", ""),
-            "cooking_method": food.get("cooking_method", ""),
-            "health_benefits": food.get("food_health_benefits", ""),
-            "taste_profile": food.get("taste_profile", ""),
-        })
+
+        metadatas.append(
+            {
+                "name": food.get("food_name", "Unknown"),
+                "cuisine_type": food.get("cuisine_type", "Unknown"),
+                "ingredients": ", ".join(food.get("food_ingredients", [])),
+                "calories": food.get("food_calories_per_serving", 0),
+                "description": food.get("food_description", ""),
+                "cooking_method": food.get("cooking_method", ""),
+                "health_benefits": food.get("food_health_benefits", ""),
+                "taste_profile": food.get("taste_profile", ""),
+            }
+        )
 
     collection.add(documents=documents, metadatas=metadatas, ids=ids)
-    return collection
 
 
-def perform_similarity_search(collection, query: str, n_results: int = 5) -> List[Dict[str, Any]]:
-    """Plain semantic similarity search."""
-    try:
-        results = collection.query(query_texts=[query], n_results=n_results)
-    except Exception as e:
-        st.error(f"Search error: {e}")
+# --------------------------------------------------------------------------
+# Search functions
+# --------------------------------------------------------------------------
+def _format_query_results(results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Convert a raw ChromaDB query response into a list of clean dicts."""
+    if not results or not results.get("ids") or not results["ids"][0]:
         return []
 
-    if not results or not results["ids"] or len(results["ids"][0]) == 0:
-        return []
-
-    formatted: List[Dict[str, Any]] = []
+    formatted = []
     for i in range(len(results["ids"][0])):
-        meta = results["metadatas"][0][i]
-        formatted.append({
-            "food_id": results["ids"][0][i],
-            "food_name": meta["name"],
-            "food_description": meta["description"],
-            "cuisine_type": meta["cuisine_type"],
-            "food_calories_per_serving": meta["calories"],
-            "ingredients": meta.get("ingredients", ""),
-            "cooking_method": meta.get("cooking_method", ""),
-            "health_benefits": meta.get("health_benefits", ""),
-            "taste_profile": meta.get("taste_profile", ""),
-            "similarity_score": 1 - results["distances"][0][i],
-            "distance": results["distances"][0][i],
-        })
+        distance = results["distances"][0][i]
+        metadata = results["metadatas"][0][i]
+        formatted.append(
+            {
+                "food_id": results["ids"][0][i],
+                "food_name": metadata["name"],
+                "food_description": metadata["description"],
+                "cuisine_type": metadata["cuisine_type"],
+                "food_calories_per_serving": metadata["calories"],
+                "similarity_score": 1 - distance,
+                "distance": distance,
+            }
+        )
     return formatted
 
 
@@ -167,209 +218,163 @@ def perform_filtered_similarity_search(
     query: str,
     cuisine_filter: Optional[str] = None,
     max_calories: Optional[int] = None,
-    n_results: int = 5,
+    n_results: int = DEFAULT_RESULT_COUNT,
 ) -> List[Dict[str, Any]]:
-    """Similarity search with optional cuisine / calorie filters."""
-    filters: List[Dict[str, Any]] = []
+    """Run a similarity search, optionally constrained by metadata filters."""
+    filters = []
     if cuisine_filter and cuisine_filter != "All":
         filters.append({"cuisine_type": cuisine_filter})
-    if max_calories:
+    if max_calories is not None:
         filters.append({"calories": {"$lte": max_calories}})
 
-    where_clause: Optional[Dict[str, Any]] = None
-    if len(filters) == 1:
-        where_clause = filters[0]
-    elif len(filters) > 1:
+    if len(filters) > 1:
         where_clause = {"$and": filters}
+    elif filters:
+        where_clause = filters[0]
+    else:
+        where_clause = None
 
     try:
-        results = collection.query(query_texts=[query], n_results=n_results, where=where_clause)
-    except Exception as e:
-        st.error(f"Filtered search error: {e}")
+        results = collection.query(
+            query_texts=[query], n_results=n_results, where=where_clause
+        )
+        return _format_query_results(results)
+    except Exception as error:
+        logger.error("Search failed for query %r: %s", query, error)
+        st.error(f"Search failed: {error}")
         return []
 
-    if not results or not results["ids"] or len(results["ids"][0]) == 0:
-        return []
 
-    formatted: List[Dict[str, Any]] = []
-    for i in range(len(results["ids"][0])):
-        meta = results["metadatas"][0][i]
-        formatted.append({
-            "food_id": results["ids"][0][i],
-            "food_name": meta["name"],
-            "food_description": meta["description"],
-            "cuisine_type": meta["cuisine_type"],
-            "food_calories_per_serving": meta["calories"],
-            "ingredients": meta.get("ingredients", ""),
-            "cooking_method": meta.get("cooking_method", ""),
-            "health_benefits": meta.get("health_benefits", ""),
-            "taste_profile": meta.get("taste_profile", ""),
-            "similarity_score": 1 - results["distances"][0][i],
-            "distance": results["distances"][0][i],
-        })
-    return formatted
+# --------------------------------------------------------------------------
+# Streamlit UI
+# --------------------------------------------------------------------------
+def render_result_card(result: Dict[str, Any]) -> None:
+    """Render a single search result as a styled card."""
+    match_pct = result["similarity_score"] * 100
+    with st.container(border=True):
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.markdown(f"### 🍽️ {result['food_name']}")
+            st.caption(f"🏷️ {result['cuisine_type']}  •  🔥 {result['food_calories_per_serving']} cal/serving")
+            st.write(result["food_description"] or "_No description available._")
+        with col2:
+            st.metric("Match", f"{match_pct:.1f}%")
 
 
-# -----------------------------------------------------------------------------
-# UI helpers
-# -----------------------------------------------------------------------------
-def match_score_bar(score: float) -> None:
-    """Render a colored progress bar for the similarity score."""
-    pct = max(0.0, min(1.0, score)) * 100
-    if pct >= 70:
-        color = "#22c55e"
-    elif pct >= 45:
-        color = "#f59e0b"
-    else:
-        color = "#ef4444"
-    st.markdown(
-        f"""
-        <div style="background:#e5e7eb;border-radius:6px;height:8px;overflow:hidden;">
-          <div style="background:{color};height:100%;width:{pct:.1f}%;"></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+def main() -> None:
+    st.set_page_config(
+        page_title="Food Search & RAG Chatbot",
+        page_icon="🍽️",
+        layout="centered",
+    )
+    st.title("🍽️ Interactive Food Search")
+    st.caption("Semantic search over a food dataset, powered by ChromaDB + sentence-transformers.")
+
+    # ---- Required file upload ------------------------------------------------
+    st.sidebar.header("📁 Dataset")
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload a food dataset (JSON) — required",
+        type=["json"],
+        help="A JSON list of food items. See README for the expected schema.",
     )
 
-
-def render_result_card(idx: int, r: Dict[str, Any]) -> None:
-    """Render a single food result as a styled card."""
-    pct = r["similarity_score"] * 100
-    with st.container(border=True):
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            st.markdown(f"### {idx}. {r['food_name']}")
-            st.caption(
-                f"{r['cuisine_type']}  •  {r['cooking_method'] or '—'}  •  "
-                f"{r['food_calories_per_serving']} cal/serving"
+    if uploaded_file is None:
+        st.warning(
+            "⬅️ Please upload a `FoodDataSet.json` file in the sidebar to get started. "
+            "No search can be performed until a dataset is loaded."
+        )
+        with st.expander("Expected file format"):
+            st.code(
+                """[
+  {
+    "food_name": "Margherita Pizza",
+    "food_description": "Classic pizza with tomato, mozzarella, and basil",
+    "food_ingredients": ["tomato", "mozzarella", "basil", "flour"],
+    "cuisine_type": "Italian",
+    "cooking_method": "baked",
+    "food_calories_per_serving": 285,
+    "food_health_benefits": "Good source of calcium",
+    "food_nutritional_factors": {"protein": "12g", "fat": "10g"},
+    "food_features": {"taste": "savory", "texture": "crispy"}
+  }
+]""",
+                language="json",
             )
-        with col2:
-            st.metric("Match", f"{pct:.1f}%")
-        match_score_bar(r["similarity_score"])
+        st.stop()
 
-        st.markdown(r["food_description"] or "_No description._")
+    # ---- Build (or reuse) the search index -----------------------------------
+    file_signature = (uploaded_file.name, uploaded_file.size)
+    if st.session_state.get("file_signature") != file_signature:
+        with st.spinner("Loading dataset and building search index..."):
+            food_items = load_food_data(uploaded_file)
+            if not food_items:
+                st.stop()
+            collection = create_similarity_search_collection(
+                COLLECTION_NAME,
+                {"description": "A collection for interactive food search"},
+            )
+            populate_similarity_collection(collection, food_items)
 
-        if r.get("taste_profile"):
-            st.markdown(f"**Taste & features:** {r['taste_profile']}")
-        if r.get("ingredients"):
-            st.markdown(f"**Ingredients:** {r['ingredients']}")
-        if r.get("health_benefits"):
-            st.markdown(f"**Health benefits:** {r['health_benefits']}")
+        st.session_state["collection"] = collection
+        st.session_state["food_items"] = food_items
+        st.session_state["file_signature"] = file_signature
+        st.toast(f"Loaded {len(food_items)} food items ✅")
 
+    collection = st.session_state["collection"]
+    food_items = st.session_state["food_items"]
+    st.sidebar.success(f"{len(food_items)} items indexed")
 
-def suggest_related_searches(results: List[Dict[str, Any]]) -> List[str]:
-    """Build a list of suggested follow-up queries based on the results."""
-    if not results:
-        return []
-    suggestions: List[str] = []
-    cuisines = list({r["cuisine_type"] for r in results if r.get("cuisine_type")})
-    for c in cuisines[:3]:
-        suggestions.append(f"{c} dishes")
+    # ---- Filters ---------------------------------------------------------------
+    st.sidebar.header("🔧 Filters")
+    cuisine_options = ["All"] + sorted(
+        {item.get("cuisine_type", "Unknown") for item in food_items}
+    )
+    cuisine_filter = st.sidebar.selectbox("Cuisine type", cuisine_options)
+    max_calories = st.sidebar.slider(
+        "Max calories per serving", min_value=0, max_value=2000, value=2000, step=50
+    )
+    n_results = st.sidebar.slider("Number of results", min_value=1, max_value=10, value=4)
 
-    avg_cal = sum(r["food_calories_per_serving"] for r in results) / max(len(results), 1)
-    if avg_cal > 350:
-        suggestions.append("low calorie")
-    else:
-        suggestions.append("hearty meal")
-    return suggestions
+    # ---- Search ------------------------------------------------------------
+    with st.expander("💡 Search examples"):
+        st.write(
+            "- `chocolate dessert` — find chocolate desserts\n"
+            "- `Italian food` — find Italian cuisine\n"
+            "- `sweet treats` — find sweet desserts\n"
+            "- `low calorie` — find lower-calorie options"
+        )
 
+    query = st.text_input("🔍 Search for food", placeholder="e.g. spicy noodle soup")
+    search_clicked = st.button("Search", type="primary", use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# Page config & init
-# -----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Interactive Food Search",
-    page_icon="🍽️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+    if search_clicked or query:
+        if not query.strip():
+            st.info("Type a search term above, then press Search.")
+            return
 
-st.title("🍽️ Interactive Food Recommendation System")
-st.caption("Semantic search over a food database powered by ChromaDB + Sentence-Transformers.")
-
-# -----------------------------------------------------------------------------
-# Load data & build collection (cached)
-# -----------------------------------------------------------------------------
-@st.cache_resource(show_spinner="Loading food database & building embeddings…")
-def init_collection():
-    client = get_chroma_client()
-    items = load_food_data(DATA_FILE)
-    coll = build_search_collection(client, items)
-    return coll, items
-
-
-try:
-    collection, food_items = init_collection()
-except Exception as e:
-    st.error(f"Failed to initialize the system: {e}")
-    st.stop()
-
-# Sidebar — filters & options
-with st.sidebar:
-    st.header("⚙️ Filters & Options")
-
-    cuisine_options = ["All"] + sorted({
-        f.get("cuisine_type", "Unknown") for f in food_items if f.get("cuisine_type")
-    })
-    selected_cuisine = st.selectbox("Cuisine", cuisine_options, index=0)
-
-    max_cal = st.slider("Max calories per serving", 0, 800, 800, step=10)
-    use_calorie_filter = st.checkbox("Enable calorie cap", value=False)
-
-    n_results = st.slider("Number of results", 1, 10, 4)
-
-    st.divider()
-    st.markdown("#### 💡 Example queries")
-    for q in [
-        "chocolate dessert",
-        "Italian food",
-        "sweet treats",
-        "spicy soup",
-        "low calorie",
-        "fried rice",
-    ]:
-        if st.button(q, key=f"example_{q}", use_container_width=True):
-            st.session_state["query"] = q
-
-    st.divider()
-    st.caption(f"📚 {len(food_items)} food items indexed.")
-
-# -----------------------------------------------------------------------------
-# Main search
-# -----------------------------------------------------------------------------
-query = st.text_input(
-    "🔍 Search for food",
-    value=st.session_state.get("query", ""),
-    placeholder="e.g. creamy Italian pasta, spicy Thai soup, low calorie salad…",
-)
-
-search_btn = st.button("Search", type="primary", use_container_width=False)
-
-if search_btn or query:
-    if not query.strip():
-        st.warning("Please enter a search term.")
-    else:
-        with st.spinner("Searching…"):
+        with st.spinner(f"Searching for '{query}'..."):
             results = perform_filtered_similarity_search(
                 collection,
-                query.strip(),
-                cuisine_filter=selected_cuisine,
-                max_calories=max_cal if use_calorie_filter else None,
+                query,
+                cuisine_filter=cuisine_filter,
+                max_calories=max_calories if max_calories < 2000 else None,
                 n_results=n_results,
             )
 
         if not results:
-            st.error("No matching foods found. Try different keywords like 'Italian', 'spicy', 'sweet', 'low calorie'.")
-        else:
-            st.success(f"Found {len(results)} recommendation{'s' if len(results) > 1 else ''} for '{query}'.")
-            for i, r in enumerate(results, 1):
-                render_result_card(i, r)
+            st.error("❌ No matching foods found. Try different keywords or loosen the filters.")
+            return
 
-            suggestions = suggest_related_searches(results)
-            if suggestions:
-                st.markdown("#### 💡 Related searches you might like")
-                cols = st.columns(len(suggestions))
-                for col, s in zip(cols, suggestions):
-                    if col.button(s, key=f"sug_{s}"):
-                        st.session_state["query"] = s
-                        st.rerun()
+        st.subheader(f"✅ Found {len(results)} recommendations")
+        for result in results:
+            render_result_card(result)
+
+        cuisines = list({r["cuisine_type"] for r in results})
+        if cuisines:
+            st.caption(
+                "💡 Related: " + ", ".join(f"`{c} dishes`" for c in cuisines[:3])
+            )
+
+
+if __name__ == "__main__":
+    main()
